@@ -1,0 +1,19 @@
+# Backend
+pharmacy-rag-api/venv/
+pharmacy-rag-api/__pycache__/
+pharmacy-rag-api/app/__pycache__/
+pharmacy-rag-api/*.pyc
+pharmacy-rag-api/app/.env
+pharmacy-rag-api/data/chunks/
+pharmacy-rag-api/data/images/
+pharmacy-rag-api/data/tables/
+pharmacy-rag-api/data/formulas/
+pharmacy-rag-api/data/chunk_vectors_cache/
+
+# Frontend
+pharmacy-rag-frontend/node_modules/
+pharmacy-rag-frontend/dist/
+pharmacy-rag-frontend/src/assets/
+
+# Dashboard
+pharmacy-rag-dashboard/.env

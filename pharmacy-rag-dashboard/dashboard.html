@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Pharmacy RAG — Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', -apple-system, Roboto, sans-serif;
+    background: #0b0d12;
+    color: #e8e9ec;
+    padding: 32px 40px;
+    font-size: 14px;
+  }
+  header { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 28px; }
+  h1 { font-size: 22px; font-weight: 600; letter-spacing: -0.3px; }
+  .sub { color: #6b7280; font-size: 12.5px; margin-top: 4px; }
+  .live-dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: #4ade80; margin-right: 6px; box-shadow: 0 0 8px #4ade80;
+    animation: pulse 1.5s infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+  #status { color: #6b7280; font-size: 12px; text-align: right; }
+
+  .stats-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 18px; }
+  .stat-card {
+    background: linear-gradient(155deg, #171a21, #12141a);
+    border-radius: 12px; padding: 20px 22px;
+    border: 1px solid #22262f;
+  }
+  .stat-card .value { font-size: 30px; font-weight: 700; letter-spacing: -0.5px; }
+  .stat-card .label { font-size: 11.5px; color: #7d8590; text-transform: uppercase; letter-spacing: 0.6px; margin-top: 4px; }
+
+  .grid { display: grid; grid-template-columns: 1.2fr 1fr; gap: 14px; margin-bottom: 14px; }
+  @media (max-width: 960px) { .grid { grid-template-columns: 1fr; } }
+
+  .panel {
+    background: #12141a; border-radius: 12px; padding: 18px 20px;
+    border: 1px solid #22262f;
+  }
+  .panel h2 {
+    font-size: 12.5px; font-weight: 600; color: #9aa1ac;
+    text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 14px;
+  }
+  .chart-box { position: relative; height: 240px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #1e222a; }
+  th { color: #6b7280; font-weight: 500; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.4px; }
+  td { color: #d1d5db; }
+  tr:last-child td { border-bottom: none; }
+
+  .activity-feed { max-height: 320px; overflow-y: auto; }
+  .activity-item { padding: 10px 0; border-bottom: 1px solid #1e222a; display: flex; gap: 10px; }
+  .activity-item:last-child { border-bottom: none; }
+  .role-icon {
+    width: 26px; height: 26px; border-radius: 50%; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center; font-size: 13px;
+  }
+  .role-human { background: #1e2a4a; }
+  .role-ai { background: #1a3324; }
+  .activity-content { flex: 1; min-width: 0; }
+  .activity-meta { color: #6b7280; font-size: 11.5px; margin-bottom: 2px; }
+  .activity-meta strong { color: #c7cbd1; }
+  .activity-text { color: #d1d5db; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .activity-time { color: #4b5563; font-size: 10.5px; margin-top: 2px; }
+
+  .error {
+    color: #fca5a5; background: #2a1518; border: 1px solid #4a2226;
+    padding: 12px 16px; border-radius: 8px; margin-bottom: 18px; font-size: 13px;
+  }
+
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-thumb { background: #2a2f3a; border-radius: 4px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Pharmacy RAG — Dashboard</h1>
+    <div class="sub"><span class="live-dot"></span>Auto-refreshing every 7s</div>
+  </div>
+  <div id="status">Loading…</div>
+</header>
+
+<div id="error-box"></div>
+
+<div class="stats-row">
+  <div class="stat-card"><div class="value" id="stat-users">—</div><div class="label">Users</div></div>
+  <div class="stat-card"><div class="value" id="stat-threads">—</div><div class="label">Threads</div></div>
+  <div class="stat-card"><div class="value" id="stat-messages">—</div><div class="label">Messages</div></div>
+</div>
+
+<div class="grid">
+  <div class="panel">
+    <h2>Messages Over Time · Last 30 Days</h2>
+    <div class="chart-box"><canvas id="timeChart"></canvas></div>
+  </div>
+  <div class="panel">
+    <h2>Top Subjects</h2>
+    <div class="chart-box"><canvas id="subjectsChart"></canvas></div>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="panel">
+    <h2>Per-User Breakdown</h2>
+    <table>
+      <thead><tr><th>User</th><th>Threads</th><th>Messages</th></tr></thead>
+      <tbody id="userTableBody"></tbody>
+    </table>
+  </div>
+  <div class="panel">
+    <h2>Database Table Sizes</h2>
+    <table>
+      <thead><tr><th>Table</th><th>Size</th></tr></thead>
+      <tbody id="sizeTableBody"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Recent Activity</h2>
+  <div class="activity-feed" id="activityFeed"></div>
+</div>
+
+<script>
+const BACKEND_URL = "http://localhost:8000";
+const REFRESH_MS = 7000;
+
+Chart.defaults.font.family = "'Segoe UI', sans-serif";
+Chart.defaults.color = '#9aa1ac';
+
+let subjectsChart, timeChart;
+
+function makeGradient(ctx, color) {
+  const g = ctx.createLinearGradient(0, 0, 0, 240);
+  g.addColorStop(0, color + '55');
+  g.addColorStop(1, color + '00');
+  return g;
+}
+
+function initCharts() {
+  const timeCtx = document.getElementById('timeChart').getContext('2d');
+  timeChart = new Chart(timeCtx, {
+    type: 'line',
+    data: { labels: [], datasets: [{
+      label: 'Messages', data: [],
+      borderColor: '#60a5fa', backgroundColor: makeGradient(timeCtx, '#60a5fa'),
+      borderWidth: 2, tension: 0.35, fill: true, pointRadius: 0, pointHoverRadius: 5
+    }]},
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { grid: { color: '#1e222a' }, ticks: { color: '#6b7280' } },
+        y: { beginAtZero: true, grid: { color: '#1e222a' }, ticks: { color: '#6b7280', precision: 0 } }
+      }
+    }
+  });
+
+  subjectsChart = new Chart(document.getElementById('subjectsChart'), {
+    type: 'bar',
+    data: { labels: [], datasets: [{
+      label: 'Threads', data: [],
+      backgroundColor: '#a78bfa', borderRadius: 6, maxBarThickness: 42
+    }]},
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { grid: { display: false }, ticks: { color: '#6b7280' } },
+        y: { beginAtZero: true, grid: { color: '#1e222a' }, ticks: { color: '#6b7280', precision: 0 } }
+      }
+    }
+  });
+}
+
+function fmtTime(iso) {
+  return new Date(iso).toLocaleString(undefined, {
+    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+  });
+}
+
+async function refresh() {
+  try {
+    const res = await fetch(`${BACKEND_URL}/dashboard/stats`);
+    const data = await res.json();
+
+    if (data.error) {
+      document.getElementById('error-box').innerHTML = `<div class="error">Backend error: ${data.error}</div>`;
+      return;
+    }
+    document.getElementById('error-box').innerHTML = '';
+
+    document.getElementById('stat-users').textContent = data.totals.users.toLocaleString();
+    document.getElementById('stat-threads').textContent = data.totals.threads.toLocaleString();
+    document.getElementById('stat-messages').textContent = data.totals.messages.toLocaleString();
+
+    timeChart.data.labels = data.messages_over_time.map(m => m.day);
+    timeChart.data.datasets[0].data = data.messages_over_time.map(m => m.count);
+    timeChart.update();
+
+    subjectsChart.data.labels = data.top_subjects.map(s => s.subject.replace(/_/g, ' '));
+    subjectsChart.data.datasets[0].data = data.top_subjects.map(s => s.count);
+    subjectsChart.update();
+
+    document.getElementById('userTableBody').innerHTML = data.per_user.map(u =>
+      `<tr><td>${u.user_id}</td><td>${u.threads}</td><td>${u.messages}</td></tr>`
+    ).join('') || '<tr><td colspan="3">No data yet</td></tr>';
+
+    document.getElementById('sizeTableBody').innerHTML = data.table_sizes.map(t =>
+      `<tr><td>${t.table}</td><td>${t.size}</td></tr>`
+    ).join('');
+
+    document.getElementById('activityFeed').innerHTML = data.recent_activity.map(a => `
+      <div class="activity-item">
+        <div class="role-icon role-${a.role}">${a.role === 'human' ? '🧑' : '🤖'}</div>
+        <div class="activity-content">
+          <div class="activity-meta"><strong>${a.user_id}</strong> · ${a.subject.replace(/_/g,' ')} · "${a.title}"</div>
+          <div class="activity-text">${a.content}</div>
+          <div class="activity-time">${fmtTime(a.timestamp)}</div>
+        </div>
+      </div>
+    `).join('') || '<p style="color:#6b7280">No activity yet</p>';
+
+    document.getElementById('status').textContent = `Updated ${new Date().toLocaleTimeString()}`;
+  } catch (e) {
+    document.getElementById('error-box').innerHTML = `<div class="error">Could not reach backend at ${BACKEND_URL} — is it running? (${e.message})</div>`;
+  }
+}
+
+initCharts();
+refresh();
+setInterval(refresh, REFRESH_MS);
+</script>
+
+</body>
+</html>
