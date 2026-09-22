@@ -21,7 +21,9 @@ from app.config import (
     GEMINI_API_KEY, GEMINI_MODEL, MAX_MESSAGES_STM
 )
 
-embed_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device="cuda")
+import torch
+device = "cuda" if torch.cuda.is_available() else "cpu"
+embed_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device=device)
 qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 ranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2")
 gemini_client = genai_client_module.Client(api_key=GEMINI_API_KEY)
@@ -251,6 +253,11 @@ def save_chat_message(thread_id: str, subject: str, query: str, answer: str, use
     if pg_conn is None:
         return
     try:
+        uuid.UUID(str(user_id))
+    except (ValueError, TypeError, AttributeError):
+        # user_id is not a valid UUID (e.g. unauthenticated curl test), skip auth-linked session insert
+        return
+    try:
         with pg_conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO chat_sessions (thread_id, user_id, subject, title)
@@ -266,10 +273,12 @@ def save_chat_message(thread_id: str, subject: str, query: str, answer: str, use
                 "INSERT INTO chat_messages (thread_id, role, content) VALUES (%s, %s, %s)",
                 (thread_id, "ai", answer),
             )
-        pg_conn.commit()
+        if not getattr(pg_conn, "autocommit", False):
+            pg_conn.commit()
     except Exception as e:
         print(f"Chat save error: {e}")
-        pg_conn.rollback()
+        if not getattr(pg_conn, "autocommit", False):
+            pg_conn.rollback()
 
 # ─── State ────────────────────────────────────────────────────────────────────
 

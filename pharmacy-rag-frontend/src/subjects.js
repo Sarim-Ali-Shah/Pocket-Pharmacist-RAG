@@ -24,6 +24,4 @@ export const SUBJECT_COLORS = {
   organic_chemistry: { accent: "#8a5a2b", soft: "#f0e4d3" },
 };
 
-export const API_URL = "http://localhost:8000";
-
-export const USER_ID = "user_1"; // hardcoded for now, can be auth later
+export const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";

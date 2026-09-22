@@ -1,8 +1,9 @@
 # app/main.py
 import psycopg2
 import uuid
-import json
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
+import jwt
+import os
 from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 import numpy as np
@@ -23,6 +24,35 @@ from qdrant_client.models import PayloadSchemaType
 from langgraph.store.postgres import PostgresStore
 from langgraph.checkpoint.postgres import PostgresSaver
 
+
+SUPABASE_PROJECT_URL = os.environ.get("SUPABASE_PROJECT_URL")
+_jwks_client = jwt.PyJWKClient(f"{SUPABASE_PROJECT_URL}/auth/v1/.well-known/jwks.json")
+
+def is_valid_uuid(val: str) -> bool:
+    if not val:
+        return False
+    try:
+        uuid.UUID(str(val))
+        return True
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+def get_current_user_id(authorization: str = Header(None), default_user: str = "default_user") -> str:
+    if not authorization:
+        return default_user
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid auth token")
+    token = authorization.split(" ")[1]
+    if not token or token in ("undefined", "null", "none"):
+        return default_user
+    try:
+        signing_key = _jwks_client.get_signing_key_from_jwt(token)
+        payload = jwt.decode(
+            token, signing_key.key, algorithms=["ES256"], audience="authenticated"
+        )
+        return payload["sub"]
+    except jwt.PyJWTError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
 def _load_chunk_vectors(subject, chunks):
     local_path = CHUNK_VECTORS_DIR / f"{subject}_vectors.npz"
@@ -77,6 +107,7 @@ async def lifespan(app: FastAPI):
     rag_pipeline.pg_store = pg_store.__enter__()
 
     rag_pipeline.pg_conn = psycopg2.connect(POSTGRES_URI)
+    rag_pipeline.pg_conn.autocommit = True
 
     print("Startup complete.")
     yield
@@ -89,9 +120,20 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Pharmacy RAG API", lifespan=lifespan)
 
 from fastapi.middleware.cors import CORSMiddleware
+cors_origins = [
+    "http://localhost:5173",
+    "http://localhost:5500",
+    "http://127.0.0.1:5173",
+    "null",
+]
+custom_frontend = os.environ.get("FRONTEND_URL")
+if custom_frontend:
+    cors_origins.append(custom_frontend)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:5500", "null"],
+    allow_origins=cors_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -129,13 +171,17 @@ def classify(request: QueryRequest):
 
 
 @app.get("/chats/{user_id}", response_model=ChatHistoryResponse)
-def get_chat_sessions(user_id: str):
-    if rag_pipeline.pg_conn is None:
+def get_chat_sessions(user_id: str, authorization: str = Header(None)):
+    user_id = get_current_user_id(authorization, default_user=user_id)
+    if rag_pipeline.pg_conn is None or not is_valid_uuid(user_id):
         return ChatHistoryResponse(sessions=[])
     try:
         with rag_pipeline.pg_conn.cursor() as cur:
             cur.execute(
-                """SELECT s.thread_id, s.subject, s.title, s.created_at
+                """SELECT s.thread_id, s.subject, s.title, s.created_at,
+                          (SELECT content FROM chat_messages m
+                           WHERE m.thread_id = s.thread_id AND m.role = 'ai'
+                           ORDER BY m.id DESC LIMIT 1) AS last_message
                    FROM chat_sessions s
                    LEFT JOIN (
                        SELECT thread_id, MAX(timestamp) AS last_activity
@@ -146,20 +192,16 @@ def get_chat_sessions(user_id: str):
                 (user_id,),
             )
             rows = cur.fetchall()
-        sessions = []
-        with rag_pipeline.pg_conn.cursor() as cur:
-            for thread_id, subject, title, created_at in rows:
-                cur.execute(
-                    """SELECT content FROM chat_messages WHERE thread_id = %s AND role = 'ai'
-                       ORDER BY id DESC LIMIT 1""",
-                    (thread_id,),
-                )
-                last = cur.fetchone()
-                sessions.append(ChatSession(
-                    thread_id=thread_id, title=title, subject=subject,
-                    created_at=created_at.isoformat(),
-                    last_message=(last[0][:80] if last else ""),
-                ))
+        sessions = [
+            ChatSession(
+                thread_id=r[0],
+                subject=r[1],
+                title=r[2],
+                created_at=r[3].isoformat() if r[3] else "",
+                last_message=(r[4][:80] if r[4] else ""),
+            )
+            for r in rows
+        ]
         return ChatHistoryResponse(sessions=sessions)
     except Exception as e:
         print(f"Chat sessions error: {e}")
@@ -167,7 +209,8 @@ def get_chat_sessions(user_id: str):
  
 
 @app.get("/chats/{user_id}/{thread_id}/messages")
-def get_chat_messages(user_id: str, thread_id: str):
+def get_chat_messages(user_id: str, thread_id: str, authorization: str = Header(None)):
+    user_id = get_current_user_id(authorization, default_user=user_id)
     if rag_pipeline.pg_conn is None:
         return {"messages": []}
     try:
@@ -187,7 +230,8 @@ def get_chat_messages(user_id: str, thread_id: str):
 
 
 @app.delete("/chats/{user_id}/{thread_id}")
-def delete_chat(user_id: str, thread_id: str):
+def delete_chat(user_id: str, thread_id: str, authorization: str = Header(None)):
+    user_id = get_current_user_id(authorization, default_user=user_id)
     if rag_pipeline.pg_conn is None:
         return {"status": "error"}
     try:
@@ -278,13 +322,13 @@ def dashboard_stats():
         return {"error": str(e)}
 
 @app.post("/query", response_model=QueryResponse)
-def query(request: QueryRequest):
+def query(request: QueryRequest, authorization: str = Header(None)):
     if request.subject not in SUBJECTS:
         raise HTTPException(status_code=400, detail=f"Invalid subject. Choose from: {SUBJECTS}")
 
     # Generate thread_id if new chat
     thread_id = request.thread_id or str(uuid.uuid4())
-    user_id = request.user_id or "default_user"
+    user_id = get_current_user_id(authorization, default_user=request.user_id or "default_user")
 
     # Load STM + LTM
     chat_history = rag_pipeline.load_chat_history(thread_id)

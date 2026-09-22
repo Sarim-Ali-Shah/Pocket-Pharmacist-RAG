@@ -1,21 +1,14 @@
-import { useEffect, useState } from "react";
-import { SUBJECTS, SUBJECT_COLORS, API_URL, USER_ID } from "./subjects";
+import { useMemo } from "react";
+import { SUBJECTS, SUBJECT_COLORS } from "./subjects";
 
-function SubjectSelect({ onSelect }) {
-  const [counts, setCounts] = useState({});
-
-  useEffect(() => {
-    fetch(`${API_URL}/chats/${USER_ID}`)
-      .then((r) => r.json())
-      .then((d) => {
-        const next = {};
-        (d.sessions || []).forEach((s) => {
-          next[s.subject] = (next[s.subject] || 0) + 1;
-        });
-        setCounts(next);
-      })
-      .catch(() => {});
-  }, []);
+function SubjectSelect({ onSelect, sessions = [], loading = false }) {
+  const counts = useMemo(() => {
+    const next = {};
+    (sessions || []).forEach((s) => {
+      next[s.subject] = (next[s.subject] || 0) + 1;
+    });
+    return next;
+  }, [sessions]);
 
   return (
     <div className="subject-select-page">
@@ -37,7 +30,11 @@ function SubjectSelect({ onSelect }) {
               <span className="subject-card-dot" />
               <span className="subject-card-name">{s.replace(/_/g, " ")}</span>
               <span className="subject-card-count">
-                {count > 0 ? `${count} thread${count === 1 ? "" : "s"}` : "No threads yet"}
+                {loading && sessions.length === 0
+                  ? "Loading..."
+                  : count > 0
+                  ? `${count} thread${count === 1 ? "" : "s"}`
+                  : "No threads yet"}
               </span>
             </button>
           );

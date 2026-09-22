@@ -17,3 +17,8 @@ pharmacy-rag-frontend/src/assets/
 
 # Dashboard
 pharmacy-rag-dashboard/.env
+
+# Local docs / zips
+*.docx
+~$*
+*.zip

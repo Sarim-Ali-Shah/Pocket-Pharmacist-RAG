@@ -1,7 +1,20 @@
 import { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { v4 as uuidv4 } from "uuid";
-import { SUBJECT_COLORS, API_URL, USER_ID } from "./subjects";
+import { SUBJECT_COLORS, API_URL } from "./subjects";
+import { supabase } from "./supabaseClient";
+
+async function authFetch(url, options = {}) {
+  const { data } = await supabase.auth.getSession();
+  const token = data.session?.access_token;
+  return fetch(url, {
+    ...options,
+    headers: {
+      ...(options.headers || {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+  });
+}
 
 function SourceCard({ src }) {
   return (
@@ -32,21 +45,23 @@ function IntentBadge({ intent }) {
   return <span className="intent-badge chat"><span className="dot" />General chat</span>;
 }
 
-function ChatWorkspace({ subject, onBack }) {
+function ChatWorkspace({ subject, onBack, userId, cachedSessions = [], onRefreshSessions }) {
   const color = SUBJECT_COLORS[subject];
 
-  const [threads, setThreads] = useState([]);
-  const [threadId, setThreadId] = useState(null);
+  const initialSubjectThreads = (cachedSessions || []).filter((s) => s.subject === subject);
+  const [threads, setThreads] = useState(initialSubjectThreads);
+  const [threadId, setThreadId] = useState(() => (initialSubjectThreads.length > 0 ? initialSubjectThreads[0].thread_id : null));
   const [messages, setMessages] = useState([]);
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
   const [loadingStage, setLoadingStage] = useState("");
   const [error, setError] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [fetchingThreads, setFetchingThreads] = useState(() => initialSubjectThreads.length === 0);
   const bottomRef = useRef(null);
 
   const refreshThreads = (preserveThreadId) => {
-    fetch(`${API_URL}/chats/${USER_ID}`)
+    authFetch(`${API_URL}/chats/${userId}`)
       .then((r) => r.json())
       .then((d) => {
         const forSubject = (d.sessions || []).filter((s) => s.subject === subject);
@@ -56,6 +71,7 @@ function ChatWorkspace({ subject, onBack }) {
           );
           return [...stillPending, ...forSubject];
         });
+        if (onRefreshSessions) onRefreshSessions();
         return forSubject;
       })
       .catch(() => []);
@@ -65,21 +81,39 @@ function ChatWorkspace({ subject, onBack }) {
   // one if it has any, or start a fresh thread if it doesn't.
   useEffect(() => {
     let cancelled = false;
-    fetch(`${API_URL}/chats/${USER_ID}`)
+
+    // Use cached threads immediately with 0ms delay!
+    const forSubject = (cachedSessions || []).filter((s) => s.subject === subject);
+    if (forSubject.length > 0) {
+      setThreads(forSubject);
+      selectThread(forSubject[0]);
+    } else {
+      startNewThread();
+    }
+
+    // Background revalidation to stay in sync
+    authFetch(`${API_URL}/chats/${userId}`)
       .then((r) => r.json())
       .then((d) => {
         if (cancelled) return;
-        const forSubject = (d.sessions || []).filter((s) => s.subject === subject);
-        setThreads(forSubject);
-        if (forSubject.length > 0) {
-          selectThread(forSubject[0]);
-        } else {
-          startNewThread();
+        const fresh = (d.sessions || []).filter((s) => s.subject === subject);
+        setThreads(fresh);
+        if (onRefreshSessions) onRefreshSessions();
+        if (fresh.length > 0) {
+          setThreadId((curr) => {
+            if (!curr || !fresh.some((t) => t.thread_id === curr)) {
+              selectThread(fresh[0]);
+              return fresh[0].thread_id;
+            }
+            return curr;
+          });
         }
       })
-      .catch(() => {
-        if (!cancelled) startNewThread();
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelled) setFetchingThreads(false);
       });
+
     return () => {
       cancelled = true;
     };
@@ -112,7 +146,7 @@ function ChatWorkspace({ subject, onBack }) {
     setQuery("");
     setError(null);
     try {
-      const res = await fetch(`${API_URL}/chats/${USER_ID}/${thread.thread_id}/messages`);
+      const res = await authFetch(`${API_URL}/chats/${userId}/${thread.thread_id}/messages`);
       const data = await res.json();
       const loaded = (data.messages || []).map((m) => ({
         id: m.id || uuidv4(),
@@ -133,7 +167,8 @@ function ChatWorkspace({ subject, onBack }) {
     e.stopPropagation();
     if (!window.confirm("Delete this thread? This can't be undone.")) return;
     try {
-      await fetch(`${API_URL}/chats/${USER_ID}/${thread.thread_id}`, { method: "DELETE" });
+      await authFetch(`${API_URL}/chats/${userId}/${thread.thread_id}`, { method: "DELETE" });
+      if (onRefreshSessions) onRefreshSessions();
     } catch {
       setError("Couldn't delete the thread — check the backend and try again.");
       return;
@@ -159,7 +194,7 @@ function ChatWorkspace({ subject, onBack }) {
     setError(null);
 
     try {
-      const classifyRes = await fetch(`${API_URL}/classify`, {
+      const classifyRes = await authFetch(`${API_URL}/classify`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query: userText, subject }),
@@ -171,10 +206,10 @@ function ChatWorkspace({ subject, onBack }) {
         }
       }
 
-      const res = await fetch(`${API_URL}/query`, {
+      const res = await authFetch(`${API_URL}/query`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: userText, subject, thread_id: threadId, user_id: USER_ID }),
+        body: JSON.stringify({ query: userText, subject, thread_id: threadId, user_id: userId }),
       });
       if (!res.ok) throw new Error(`Server error: ${res.status}`);
       const data = await res.json();
@@ -240,7 +275,12 @@ function ChatWorkspace({ subject, onBack }) {
               </button>
             </div>
           ))}
-          {threads.length === 0 && <p className="no-sessions">No threads yet — ask something to start one.</p>}
+          {threads.length === 0 && !fetchingThreads && (
+            <p className="no-sessions">No threads yet — ask something to start one.</p>
+          )}
+          {threads.length === 0 && fetchingThreads && (
+            <p className="no-sessions">Loading threads...</p>
+          )}
         </div>
       </div>
 
