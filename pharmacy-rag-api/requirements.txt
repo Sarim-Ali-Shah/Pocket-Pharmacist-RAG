@@ -16,3 +16,4 @@ huggingface_hub
 
 psycopg[binary,pool]
 langgraph-checkpoint-postgres
+gradio
