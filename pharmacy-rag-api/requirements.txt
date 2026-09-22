@@ -15,5 +15,6 @@ pydantic
 huggingface_hub
 
 psycopg[binary,pool]
+psycopg2-binary
 langgraph-checkpoint-postgres
 pyjwt[crypto]
