@@ -139,6 +139,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+FORMULAS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/images", StaticFiles(directory=str(IMAGES_DIR)), name="images")
 app.mount("/formulas", StaticFiles(directory=str(FORMULAS_DIR)), name="formulas")
 
