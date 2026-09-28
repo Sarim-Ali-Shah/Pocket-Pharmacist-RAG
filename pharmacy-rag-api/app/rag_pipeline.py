@@ -40,18 +40,46 @@ gemini_client = genai_client_module.Client(api_key=GEMINI_API_KEY)
 all_chunks = {}
 bm25_indexes = {}
 chunk_vectors_cache = {}
+_loaded_subjects_order = []
+
+def ensure_subject_loaded(subject: str, max_books: int = 2):
+    """Keeps at most max_books (default: 2) in memory at any time to guarantee RAM stays < 512 MB.
+    Uses Least Recently Used (LRU) eviction.
+    """
+    global all_chunks, bm25_indexes, chunk_vectors_cache, _loaded_subjects_order
+    import gc
+    from app.data_loader import load_subject_chunks, build_subject_bm25, load_subject_vectors
+
+    if subject in all_chunks and subject in bm25_indexes and subject in chunk_vectors_cache:
+        if subject in _loaded_subjects_order:
+            _loaded_subjects_order.remove(subject)
+        _loaded_subjects_order.append(subject)
+        return
+
+    # Evict oldest subject if we reached the max_books limit
+    while len(_loaded_subjects_order) >= max_books:
+        evicted = _loaded_subjects_order.pop(0)
+        print(f"[Memory Manager] Evicting {evicted} from RAM to free memory...")
+        all_chunks.pop(evicted, None)
+        bm25_indexes.pop(evicted, None)
+        chunk_vectors_cache.pop(evicted, None)
+        gc.collect()
+
+    print(f"[Memory Manager] Loading '{subject}' into memory...")
+    chunks = load_subject_chunks(subject)
+    bm25 = build_subject_bm25(chunks)
+    vectors = load_subject_vectors(subject)
+
+    all_chunks[subject] = chunks
+    bm25_indexes[subject] = bm25
+    chunk_vectors_cache[subject] = vectors
+    _loaded_subjects_order.append(subject)
+    print(f"[Memory Manager] '{subject}' is ready. Active in RAM ({len(_loaded_subjects_order)}/{max_books}): {_loaded_subjects_order}")
 
 # STM + LTM stores — set from main.py at startup
 pg_store = None        # PostgresStore for LTM (user profile)
 pg_checkpointer = None # PostgresSaver for STM (chat history)
-
 USE_COMPRESSION = False
-
-
-def get_chunk_vectors(subject):
-    texts = [c["text"] for c in all_chunks[subject]]
-    vectors = [encode_query(t) for t in texts]
-    return {c["chunk_id"]: v for c, v in zip(all_chunks[subject], vectors)}
 
 
 def _summarize_search_io(inputs: dict) -> dict:
@@ -397,6 +425,7 @@ Answer:"""
 @traceable(name="extract_book_filter_node")
 def extract_book_filter_node(state: RAGState) -> RAGState:
     subject = state["subject"]
+    ensure_subject_loaded(subject)
     book_names = sorted({c.get("book_name") for c in all_chunks[subject] if c.get("book_name")})
     if not book_names:
         state["book_filter"] = None
@@ -423,6 +452,7 @@ def retrieve_node(state: RAGState) -> RAGState:
         return state
 
     query, subject = state["query"], state["subject"]
+    ensure_subject_loaded(subject)
     book_filter = state.get("book_filter")
     candidates = hybrid_search(query, subject, top_k=10, book_filter=book_filter)
     query_vec = encode_query(query)

@@ -16,7 +16,7 @@ from app.config import (
     SUBJECTS, IMAGES_DIR, FORMULAS_DIR, CHUNK_VECTORS_DIR,
     HF_TOKEN, HF_REPO, POSTGRES_URI
 )
-from app.data_loader import load_all_chunks, build_bm25_indexes, ensure_table_image
+from app.data_loader import ensure_table_image
 from app.models import QueryRequest, QueryResponse, SourceItem, ChatSession, ChatHistoryResponse
 import app.rag_pipeline as rag_pipeline
 from qdrant_client.models import PayloadSchemaType
@@ -54,29 +54,14 @@ def get_current_user_id(authorization: str = Header(None), default_user: str = "
     except jwt.PyJWTError as e:
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
-def _load_chunk_vectors(subject, chunks):
-    local_path = CHUNK_VECTORS_DIR / f"{subject}_vectors.npz"
-    if not local_path.exists():
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        downloaded = hf_hub_download(
-            repo_id=HF_REPO,
-            filename=f"chunk_vectors_cache/{subject}_vectors.npz",
-            repo_type="dataset",
-            token=HF_TOKEN
-        )
-        shutil.copy(downloaded, local_path)
-    data = np.load(local_path, allow_pickle=True)
-    return {cid: vec for cid, vec in zip(data["ids"], data["vectors"])}
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── Chunks + BM25 ──────────────────────────────────────────
-    print("Loading chunks and BM25 indexes...")
-    all_chunks = load_all_chunks()
-    bm25_indexes = build_bm25_indexes(all_chunks)
-    rag_pipeline.all_chunks = all_chunks
-    rag_pipeline.bm25_indexes = bm25_indexes
+    # ── Preload default subject (keeps RAM < 150 MB at boot) ───
+    print("Pre-loading default subject (biopharmaceutics) into RAM...")
+    try:
+        rag_pipeline.ensure_subject_loaded("biopharmaceutics", max_books=2)
+    except Exception as e:
+        print(f"Warning: Failed to preload default subject: {e}")
 
     # ── Qdrant payload indexes ─────────────────────────────────
     print("Creating Qdrant payload indexes...")
@@ -89,12 +74,6 @@ async def lifespan(app: FastAPI):
             )
         except Exception:
             pass  # already exists
-
-    # ── Chunk vectors ──────────────────────────────────────────
-    print("Loading chunk vectors...")
-    rag_pipeline.chunk_vectors_cache = {
-        subject: _load_chunk_vectors(subject, all_chunks[subject]) for subject in SUBJECTS
-    }
 
     # ── Postgres STM + LTM ─────────────────────────────────────
     print("Setting up Postgres STM + LTM...")
@@ -109,7 +88,7 @@ async def lifespan(app: FastAPI):
     rag_pipeline.pg_conn = psycopg2.connect(POSTGRES_URI)
     rag_pipeline.pg_conn.autocommit = True
 
-    print("Startup complete.")
+    print("Startup complete. Server is ready!")
     yield
 
     # ── Cleanup ────────────────────────────────────────────────
@@ -162,6 +141,7 @@ def root():
 def get_books(subject: str):
     if subject not in SUBJECTS:
         raise HTTPException(status_code=400, detail="Invalid subject.")
+    rag_pipeline.ensure_subject_loaded(subject, max_books=2)
     books = sorted({c.get("book_name") for c in rag_pipeline.all_chunks[subject] if c.get("book_name")})
     return {"subject": subject, "books": books}
 
@@ -327,6 +307,8 @@ def dashboard_stats():
 def query(request: QueryRequest, authorization: str = Header(None)):
     if request.subject not in SUBJECTS:
         raise HTTPException(status_code=400, detail=f"Invalid subject. Choose from: {SUBJECTS}")
+
+    rag_pipeline.ensure_subject_loaded(request.subject, max_books=2)
 
     # Generate thread_id if new chat
     thread_id = request.thread_id or str(uuid.uuid4())

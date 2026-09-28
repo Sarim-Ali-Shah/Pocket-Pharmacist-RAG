@@ -19,21 +19,42 @@ def _ensure_local(remote_name, local_path):
     downloaded = hf_hub_download(repo_id=HF_REPO, filename=remote_name, repo_type="dataset", token=HF_TOKEN)
     shutil.copy(downloaded, local_path)
 
+def load_subject_chunks(subject: str):
+    local_path = CHUNKS_DIR / f"{subject}_chunks.json"
+    _ensure_local(f"chunks_final/{subject}_chunks.json", local_path)
+    with open(local_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def build_subject_bm25(chunks):
+    texts = [c["text"] for c in chunks]
+    tokenized = [t.lower().split() for t in texts]
+    return BM25Okapi(tokenized)
+
+def load_subject_vectors(subject: str):
+    import numpy as np
+    local_path = CHUNK_VECTORS_DIR / f"{subject}_vectors.npz"
+    if not local_path.exists():
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        downloaded = hf_hub_download(
+            repo_id=HF_REPO,
+            filename=f"chunk_vectors_cache/{subject}_vectors.npz",
+            repo_type="dataset",
+            token=HF_TOKEN
+        )
+        shutil.copy(downloaded, local_path)
+    data = np.load(local_path, allow_pickle=True)
+    return {cid: vec for cid, vec in zip(data["ids"], data["vectors"])}
+
 def load_all_chunks():
     all_chunks = {}
     for subject in SUBJECTS:
-        local_path = CHUNKS_DIR / f"{subject}_chunks.json"
-        _ensure_local(f"chunks_final/{subject}_chunks.json", local_path)
-        with open(local_path, "r", encoding="utf-8") as f:
-            all_chunks[subject] = json.load(f)
+        all_chunks[subject] = load_subject_chunks(subject)
     return all_chunks
 
 def build_bm25_indexes(all_chunks):
     bm25_indexes = {}
     for subject, chunks in all_chunks.items():
-        texts = [c["text"] for c in chunks]
-        tokenized = [t.lower().split() for t in texts]
-        bm25_indexes[subject] = BM25Okapi(tokenized)
+        bm25_indexes[subject] = build_subject_bm25(chunks)
     return bm25_indexes
 
 
