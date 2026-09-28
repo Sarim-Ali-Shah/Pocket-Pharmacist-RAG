@@ -77,23 +77,40 @@ async def lifespan(app: FastAPI):
 
     # ── Postgres STM + LTM ─────────────────────────────────────
     print("Setting up Postgres STM + LTM...")
-    # Setup tables once
-    with PostgresSaver.from_conn_string(POSTGRES_URI) as saver:
-        saver.setup()
+    try:
+        with PostgresSaver.from_conn_string(POSTGRES_URI) as saver:
+            saver.setup()
+    except Exception as e:
+        print(f"PostgresSaver setup note (tables already exist or pooler reused): {e}")
 
     # Persistent connections
-    pg_store = PostgresStore.from_conn_string(POSTGRES_URI)
-    rag_pipeline.pg_store = pg_store.__enter__()
+    pg_store = None
+    try:
+        pg_store = PostgresStore.from_conn_string(POSTGRES_URI)
+        rag_pipeline.pg_store = pg_store.__enter__()
+    except Exception as e:
+        print(f"PostgresStore setup note: {e}")
 
-    rag_pipeline.pg_conn = psycopg2.connect(POSTGRES_URI)
-    rag_pipeline.pg_conn.autocommit = True
+    try:
+        rag_pipeline.pg_conn = psycopg2.connect(POSTGRES_URI)
+        rag_pipeline.pg_conn.autocommit = True
+    except Exception as e:
+        print(f"psycopg2 connect note: {e}")
 
     print("Startup complete. Server is ready!")
     yield
 
     # ── Cleanup ────────────────────────────────────────────────
-    pg_store.__exit__(None, None, None)
-    rag_pipeline.pg_conn.close()
+    if pg_store is not None:
+        try:
+            pg_store.__exit__(None, None, None)
+        except Exception:
+            pass
+    if rag_pipeline.pg_conn is not None:
+        try:
+            rag_pipeline.pg_conn.close()
+        except Exception:
+            pass
 
 
 app = FastAPI(title="Pharmacy RAG API", lifespan=lifespan)
