@@ -1,9 +1,7 @@
-torch>=2.2.0
 python-dotenv
 fastapi
 uvicorn[standard]
 qdrant-client
-sentence-transformers
 rank_bm25
 flashrank
 langgraph

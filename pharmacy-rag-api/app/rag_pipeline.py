@@ -7,23 +7,32 @@ from typing import TypedDict, List, Optional
 import psycopg2
 import psycopg2.extras
 
-from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from flashrank import Ranker, RerankRequest
 from google import genai as genai_client_module
 from langgraph.graph import StateGraph, END
 from langsmith import traceable
+from huggingface_hub import InferenceClient
 
 pg_conn = None  # plain psycopg2 connection for chat_sessions/chat_messages
 
 from app.config import (
     EMBEDDING_MODEL_NAME, QDRANT_URL, QDRANT_API_KEY,
-    GEMINI_API_KEY, GEMINI_MODEL, MAX_MESSAGES_STM
+    GEMINI_API_KEY, GEMINI_MODEL, MAX_MESSAGES_STM, HF_TOKEN
 )
 
-import torch
-device = "cuda" if torch.cuda.is_available() else "cpu"
-embed_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device=device)
+hf_client = InferenceClient(token=HF_TOKEN)
+
+def encode_query(text: str) -> np.ndarray:
+    vec = hf_client.feature_extraction(text, model=EMBEDDING_MODEL_NAME, normalize=True)
+    vec = np.array(vec, dtype=np.float32)
+    if vec.ndim > 1:
+        vec = vec.squeeze(0)
+    norm = np.linalg.norm(vec)
+    if norm > 0:
+        vec = vec / norm
+    return vec
+
 qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 ranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2")
 gemini_client = genai_client_module.Client(api_key=GEMINI_API_KEY)
@@ -41,7 +50,7 @@ USE_COMPRESSION = False
 
 def get_chunk_vectors(subject):
     texts = [c["text"] for c in all_chunks[subject]]
-    vectors = embed_model.encode(texts, normalize_embeddings=True, batch_size=32)
+    vectors = [encode_query(t) for t in texts]
     return {c["chunk_id"]: v for c, v in zip(all_chunks[subject], vectors)}
 
 
@@ -71,7 +80,7 @@ def _summarize_pairs_output(output):
 @traceable(name="dense_search", process_inputs=_summarize_search_io, process_outputs=_summarize_chunk_list_output)
 def dense_search(query, subject, top_k=10, book_filter=None):
     from qdrant_client.models import Filter, FieldCondition, MatchValue
-    query_vector = embed_model.encode(query, normalize_embeddings=True).tolist()
+    query_vector = encode_query(query).tolist()
     qdrant_filter = None
     if book_filter:
         qdrant_filter = Filter(must=[FieldCondition(key="book_name", match=MatchValue(value=book_filter))])
@@ -416,7 +425,7 @@ def retrieve_node(state: RAGState) -> RAGState:
     query, subject = state["query"], state["subject"]
     book_filter = state.get("book_filter")
     candidates = hybrid_search(query, subject, top_k=10, book_filter=book_filter)
-    query_vec = embed_model.encode(query, normalize_embeddings=True)
+    query_vec = encode_query(query)
     chunk_vecs = chunk_vectors_cache[subject]
     diverse = mmr(query_vec, candidates, chunk_vecs, top_k=8)
     reranked = rerank(query, diverse, top_k=5)
