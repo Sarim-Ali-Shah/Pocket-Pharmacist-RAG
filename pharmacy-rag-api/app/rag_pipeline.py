@@ -41,40 +41,43 @@ all_chunks = {}
 bm25_indexes = {}
 chunk_vectors_cache = {}
 _loaded_subjects_order = []
+import threading
+_loading_lock = threading.Lock()
 
 def ensure_subject_loaded(subject: str, max_books: int = 2):
     """Keeps at most max_books (default: 2) in memory at any time to guarantee RAM stays < 512 MB.
-    Uses Least Recently Used (LRU) eviction.
+    Uses Least Recently Used (LRU) eviction and a thread-safe lock.
     """
     global all_chunks, bm25_indexes, chunk_vectors_cache, _loaded_subjects_order
     import gc
     from app.data_loader import load_subject_chunks, build_subject_bm25, load_subject_vectors
 
-    if subject in all_chunks and subject in bm25_indexes and subject in chunk_vectors_cache:
-        if subject in _loaded_subjects_order:
-            _loaded_subjects_order.remove(subject)
+    with _loading_lock:
+        if subject in all_chunks and subject in bm25_indexes and subject in chunk_vectors_cache:
+            if subject in _loaded_subjects_order:
+                _loaded_subjects_order.remove(subject)
+            _loaded_subjects_order.append(subject)
+            return
+
+        # Evict oldest subject if we reached the max_books limit
+        while len(_loaded_subjects_order) >= max_books:
+            evicted = _loaded_subjects_order.pop(0)
+            print(f"[Memory Manager] Evicting {evicted} from RAM to free memory...")
+            all_chunks.pop(evicted, None)
+            bm25_indexes.pop(evicted, None)
+            chunk_vectors_cache.pop(evicted, None)
+            gc.collect()
+
+        print(f"[Memory Manager] Loading '{subject}' into memory...")
+        chunks = load_subject_chunks(subject)
+        bm25 = build_subject_bm25(chunks)
+        vectors = load_subject_vectors(subject)
+
+        all_chunks[subject] = chunks
+        bm25_indexes[subject] = bm25
+        chunk_vectors_cache[subject] = vectors
         _loaded_subjects_order.append(subject)
-        return
-
-    # Evict oldest subject if we reached the max_books limit
-    while len(_loaded_subjects_order) >= max_books:
-        evicted = _loaded_subjects_order.pop(0)
-        print(f"[Memory Manager] Evicting {evicted} from RAM to free memory...")
-        all_chunks.pop(evicted, None)
-        bm25_indexes.pop(evicted, None)
-        chunk_vectors_cache.pop(evicted, None)
-        gc.collect()
-
-    print(f"[Memory Manager] Loading '{subject}' into memory...")
-    chunks = load_subject_chunks(subject)
-    bm25 = build_subject_bm25(chunks)
-    vectors = load_subject_vectors(subject)
-
-    all_chunks[subject] = chunks
-    bm25_indexes[subject] = bm25
-    chunk_vectors_cache[subject] = vectors
-    _loaded_subjects_order.append(subject)
-    print(f"[Memory Manager] '{subject}' is ready. Active in RAM ({len(_loaded_subjects_order)}/{max_books}): {_loaded_subjects_order}")
+        print(f"[Memory Manager] '{subject}' is ready. Active in RAM ({len(_loaded_subjects_order)}/{max_books}): {_loaded_subjects_order}")
 
 # STM + LTM stores — set from main.py at startup
 pg_store = None        # PostgresStore for LTM (user profile)
@@ -127,14 +130,17 @@ def sparse_search(query, subject, top_k=10):
 def rrf_fusion(dense_results, sparse_results, chunks, k=60, top_k=5):
     scores = {}
     for rank, r in enumerate(dense_results):
-        cid = r.payload["chunk_id"]
-        scores[cid] = scores.get(cid, 0) + 1 / (k + rank + 1)
+        cid = r.payload.get("chunk_id")
+        if cid:
+            scores[cid] = scores.get(cid, 0) + 1 / (k + rank + 1)
     for rank, (idx, score) in enumerate(sparse_results):
-        cid = chunks[idx]["chunk_id"]
-        scores[cid] = scores.get(cid, 0) + 1 / (k + rank + 1)
+        if idx < len(chunks):
+            cid = chunks[idx].get("chunk_id")
+            if cid:
+                scores[cid] = scores.get(cid, 0) + 1 / (k + rank + 1)
     sorted_ids = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
     id_to_chunk = {c["chunk_id"]: c for c in chunks}
-    return [(id_to_chunk[cid], score) for cid, score in sorted_ids]
+    return [(id_to_chunk[cid], score) for cid, score in sorted_ids if cid in id_to_chunk]
 
 
 @traceable(name="hybrid_search", process_inputs=_summarize_search_io, process_outputs=_summarize_pairs_output)
@@ -150,16 +156,21 @@ def hybrid_search(query, subject, top_k=5, book_filter=None):
 @traceable(name="mmr", process_outputs=_summarize_pairs_output)
 def mmr(query_vector, candidates, chunk_vectors, top_k=5, lambda_param=0.5):
     selected = []
-    remaining = list(candidates)
+    remaining = [c for c in candidates if c[0].get("chunk_id") in chunk_vectors]
     while remaining and len(selected) < top_k:
         best_score, best_item = -1, None
         for chunk, orig_score in remaining:
-            vec = np.array(chunk_vectors[chunk["chunk_id"]])
+            cid = chunk["chunk_id"]
+            if cid not in chunk_vectors:
+                continue
+            vec = np.array(chunk_vectors[cid])
             relevance = np.dot(query_vector, vec)
-            sim_to_selected = max((np.dot(vec, np.array(chunk_vectors[s[0]["chunk_id"]])) for s in selected), default=0)
+            sim_to_selected = max((np.dot(vec, np.array(chunk_vectors[s[0]["chunk_id"]])) for s in selected if s[0]["chunk_id"] in chunk_vectors), default=0)
             mmr_score = lambda_param * relevance - (1 - lambda_param) * sim_to_selected
             if mmr_score > best_score:
                 best_score, best_item = mmr_score, (chunk, orig_score)
+        if best_item is None:
+            break
         selected.append(best_item)
         remaining.remove(best_item)
     return selected

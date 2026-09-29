@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 import numpy as np
 from huggingface_hub import hf_hub_download
 import shutil
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from datetime import datetime, timezone
 
 from app.config import (
@@ -140,6 +140,23 @@ FORMULAS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/images", StaticFiles(directory=str(IMAGES_DIR)), name="images")
 app.mount("/formulas", StaticFiles(directory=str(FORMULAS_DIR)), name="formulas")
 
+STATIC_BOOKS = {
+    "anatomy": ["Grays Anatomy 33th Edition", "Snell Clinical Anatomy 9th Edition", "The Big Picture Gross Anatomy"],
+    "biochemistry": ["Lippincott Biochemistry 8th Edition", "Biochemistry 8th Edition", "A Textbook of Biochemistry 7th Edition", "Textbook of Biochemistry with Clinical Corelation  4th Edition"],
+    "medical_physiology": ["Pocket Companion to Guyton and Hall Textbook of Medical Physiology-12E", "Jaypee Essentials of medical physiology-6Ed", "Ganongs Review of Medical Physiology", "text book of practical  physiology"],
+    "organic_chemistry": ["Caravan Test Your Chemistry", "Morrison Boyd Organic Chemistry", "Organic Chemistry The Fundamental Principles (4th Edition, Vol-1)", "Advanced Organic chemistry 3rd Edition"],
+}
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    import traceback
+    traceback.print_exc()
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc)},
+        headers={"Access-Control-Allow-Origin": "*"}
+    )
+
 
 @app.get("/tables/{filename}")
 def get_table_image(filename: str):
@@ -158,8 +175,7 @@ def root():
 def get_books(subject: str):
     if subject not in SUBJECTS:
         raise HTTPException(status_code=400, detail="Invalid subject.")
-    rag_pipeline.ensure_subject_loaded(subject, max_books=2)
-    books = sorted({c.get("book_name") for c in rag_pipeline.all_chunks[subject] if c.get("book_name")})
+    books = STATIC_BOOKS.get(subject, [])
     return {"subject": subject, "books": books}
 
 
