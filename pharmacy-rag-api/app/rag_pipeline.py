@@ -7,32 +7,23 @@ from typing import TypedDict, List, Optional
 import psycopg2
 import psycopg2.extras
 
+from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
 from flashrank import Ranker, RerankRequest
 from google import genai as genai_client_module
 from langgraph.graph import StateGraph, END
 from langsmith import traceable
-from huggingface_hub import InferenceClient
 
 pg_conn = None  # plain psycopg2 connection for chat_sessions/chat_messages
 
 from app.config import (
     EMBEDDING_MODEL_NAME, QDRANT_URL, QDRANT_API_KEY,
-    GEMINI_API_KEY, GEMINI_MODEL, MAX_MESSAGES_STM, HF_TOKEN
+    GEMINI_API_KEY, GEMINI_MODEL, MAX_MESSAGES_STM
 )
 
-hf_client = InferenceClient(token=HF_TOKEN)
-
-def encode_query(text: str) -> np.ndarray:
-    vec = hf_client.feature_extraction(text, model=EMBEDDING_MODEL_NAME, normalize=True)
-    vec = np.array(vec, dtype=np.float32)
-    if vec.ndim > 1:
-        vec = vec.squeeze(0)
-    norm = np.linalg.norm(vec)
-    if norm > 0:
-        vec = vec / norm
-    return vec
-
+import torch
+device = "cuda" if torch.cuda.is_available() else "cpu"
+embed_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device=device)
 qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 ranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2")
 gemini_client = genai_client_module.Client(api_key=GEMINI_API_KEY)
@@ -40,49 +31,18 @@ gemini_client = genai_client_module.Client(api_key=GEMINI_API_KEY)
 all_chunks = {}
 bm25_indexes = {}
 chunk_vectors_cache = {}
-_loaded_subjects_order = []
-import threading
-_loading_lock = threading.Lock()
-
-def ensure_subject_loaded(subject: str, max_books: int = 2):
-    """Keeps at most max_books (default: 2) in memory at any time to guarantee RAM stays < 512 MB.
-    Uses Least Recently Used (LRU) eviction and a thread-safe lock.
-    """
-    global all_chunks, bm25_indexes, chunk_vectors_cache, _loaded_subjects_order
-    import gc
-    from app.data_loader import load_subject_chunks, build_subject_bm25, load_subject_vectors
-
-    with _loading_lock:
-        if subject in all_chunks and subject in bm25_indexes and subject in chunk_vectors_cache:
-            if subject in _loaded_subjects_order:
-                _loaded_subjects_order.remove(subject)
-            _loaded_subjects_order.append(subject)
-            return
-
-        # Evict oldest subject if we reached the max_books limit
-        while len(_loaded_subjects_order) >= max_books:
-            evicted = _loaded_subjects_order.pop(0)
-            print(f"[Memory Manager] Evicting {evicted} from RAM to free memory...")
-            all_chunks.pop(evicted, None)
-            bm25_indexes.pop(evicted, None)
-            chunk_vectors_cache.pop(evicted, None)
-            gc.collect()
-
-        print(f"[Memory Manager] Loading '{subject}' into memory...")
-        chunks = load_subject_chunks(subject)
-        bm25 = build_subject_bm25(chunks)
-        vectors = load_subject_vectors(subject)
-
-        all_chunks[subject] = chunks
-        bm25_indexes[subject] = bm25
-        chunk_vectors_cache[subject] = vectors
-        _loaded_subjects_order.append(subject)
-        print(f"[Memory Manager] '{subject}' is ready. Active in RAM ({len(_loaded_subjects_order)}/{max_books}): {_loaded_subjects_order}")
 
 # STM + LTM stores — set from main.py at startup
 pg_store = None        # PostgresStore for LTM (user profile)
 pg_checkpointer = None # PostgresSaver for STM (chat history)
+
 USE_COMPRESSION = False
+
+
+def get_chunk_vectors(subject):
+    texts = [c["text"] for c in all_chunks[subject]]
+    vectors = embed_model.encode(texts, normalize_embeddings=True, batch_size=32)
+    return {c["chunk_id"]: v for c, v in zip(all_chunks[subject], vectors)}
 
 
 def _summarize_search_io(inputs: dict) -> dict:
@@ -111,7 +71,7 @@ def _summarize_pairs_output(output):
 @traceable(name="dense_search", process_inputs=_summarize_search_io, process_outputs=_summarize_chunk_list_output)
 def dense_search(query, subject, top_k=10, book_filter=None):
     from qdrant_client.models import Filter, FieldCondition, MatchValue
-    query_vector = encode_query(query).tolist()
+    query_vector = embed_model.encode(query, normalize_embeddings=True).tolist()
     qdrant_filter = None
     if book_filter:
         qdrant_filter = Filter(must=[FieldCondition(key="book_name", match=MatchValue(value=book_filter))])
@@ -130,14 +90,11 @@ def sparse_search(query, subject, top_k=10):
 def rrf_fusion(dense_results, sparse_results, chunks, k=60, top_k=5):
     scores = {}
     for rank, r in enumerate(dense_results):
-        cid = r.payload.get("chunk_id")
-        if cid:
-            scores[cid] = scores.get(cid, 0) + 1 / (k + rank + 1)
+        cid = r.payload["chunk_id"]
+        scores[cid] = scores.get(cid, 0) + 1 / (k + rank + 1)
     for rank, (idx, score) in enumerate(sparse_results):
-        if idx < len(chunks):
-            cid = chunks[idx].get("chunk_id")
-            if cid:
-                scores[cid] = scores.get(cid, 0) + 1 / (k + rank + 1)
+        cid = chunks[idx]["chunk_id"]
+        scores[cid] = scores.get(cid, 0) + 1 / (k + rank + 1)
     sorted_ids = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
     id_to_chunk = {c["chunk_id"]: c for c in chunks}
     return [(id_to_chunk[cid], score) for cid, score in sorted_ids if cid in id_to_chunk]
@@ -436,7 +393,6 @@ Answer:"""
 @traceable(name="extract_book_filter_node")
 def extract_book_filter_node(state: RAGState) -> RAGState:
     subject = state["subject"]
-    ensure_subject_loaded(subject)
     book_names = sorted({c.get("book_name") for c in all_chunks[subject] if c.get("book_name")})
     if not book_names:
         state["book_filter"] = None
@@ -463,10 +419,9 @@ def retrieve_node(state: RAGState) -> RAGState:
         return state
 
     query, subject = state["query"], state["subject"]
-    ensure_subject_loaded(subject)
     book_filter = state.get("book_filter")
     candidates = hybrid_search(query, subject, top_k=10, book_filter=book_filter)
-    query_vec = encode_query(query)
+    query_vec = embed_model.encode(query, normalize_embeddings=True)
     chunk_vecs = chunk_vectors_cache[subject]
     diverse = mmr(query_vec, candidates, chunk_vecs, top_k=8)
     reranked = rerank(query, diverse, top_k=5)

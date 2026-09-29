@@ -9,14 +9,14 @@ from contextlib import asynccontextmanager
 import numpy as np
 from huggingface_hub import hf_hub_download
 import shutil
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from datetime import datetime, timezone
 
 from app.config import (
     SUBJECTS, IMAGES_DIR, FORMULAS_DIR, CHUNK_VECTORS_DIR,
     HF_TOKEN, HF_REPO, POSTGRES_URI
 )
-from app.data_loader import ensure_table_image
+from app.data_loader import load_all_chunks, build_bm25_indexes, ensure_table_image
 from app.models import QueryRequest, QueryResponse, SourceItem, ChatSession, ChatHistoryResponse
 import app.rag_pipeline as rag_pipeline
 from qdrant_client.models import PayloadSchemaType
@@ -54,14 +54,29 @@ def get_current_user_id(authorization: str = Header(None), default_user: str = "
     except jwt.PyJWTError as e:
         raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
 
+def _load_chunk_vectors(subject, chunks):
+    local_path = CHUNK_VECTORS_DIR / f"{subject}_vectors.npz"
+    if not local_path.exists():
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        downloaded = hf_hub_download(
+            repo_id=HF_REPO,
+            filename=f"chunk_vectors_cache/{subject}_vectors.npz",
+            repo_type="dataset",
+            token=HF_TOKEN
+        )
+        shutil.copy(downloaded, local_path)
+    data = np.load(local_path, allow_pickle=True)
+    return {cid: vec for cid, vec in zip(data["ids"], data["vectors"])}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── Preload default subject (keeps RAM < 150 MB at boot) ───
-    print("Pre-loading default subject (biopharmaceutics) into RAM...")
-    try:
-        rag_pipeline.ensure_subject_loaded("biopharmaceutics", max_books=2)
-    except Exception as e:
-        print(f"Warning: Failed to preload default subject: {e}")
+    # ── Chunks + BM25 ──────────────────────────────────────────
+    print("Loading chunks and BM25 indexes...")
+    all_chunks = load_all_chunks()
+    bm25_indexes = build_bm25_indexes(all_chunks)
+    rag_pipeline.all_chunks = all_chunks
+    rag_pipeline.bm25_indexes = bm25_indexes
 
     # ── Qdrant payload indexes ─────────────────────────────────
     print("Creating Qdrant payload indexes...")
@@ -75,13 +90,19 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass  # already exists
 
+    # ── Chunk vectors ──────────────────────────────────────────
+    print("Loading chunk vectors...")
+    rag_pipeline.chunk_vectors_cache = {
+        subject: _load_chunk_vectors(subject, all_chunks[subject]) for subject in SUBJECTS
+    }
+
     # ── Postgres STM + LTM ─────────────────────────────────────
     print("Setting up Postgres STM + LTM...")
     try:
         with PostgresSaver.from_conn_string(POSTGRES_URI) as saver:
             saver.setup()
     except Exception as e:
-        print(f"PostgresSaver setup note (tables already exist or pooler reused): {e}")
+        print(f"PostgresSaver setup note (tables already exist): {e}")
 
     # Persistent connections
     pg_store = None
@@ -97,7 +118,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"psycopg2 connect note: {e}")
 
-    print("Startup complete. Server is ready!")
+    print("Startup complete.")
     yield
 
     # ── Cleanup ────────────────────────────────────────────────
@@ -120,6 +141,7 @@ cors_origins = [
     "http://localhost:5173",
     "http://localhost:5500",
     "http://127.0.0.1:5173",
+    "http://localhost:3000",
     "null",
 ]
 custom_frontend = os.environ.get("FRONTEND_URL")
@@ -140,23 +162,6 @@ FORMULAS_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/images", StaticFiles(directory=str(IMAGES_DIR)), name="images")
 app.mount("/formulas", StaticFiles(directory=str(FORMULAS_DIR)), name="formulas")
 
-STATIC_BOOKS = {
-    "anatomy": ["Grays Anatomy 33th Edition", "Snell Clinical Anatomy 9th Edition", "The Big Picture Gross Anatomy"],
-    "biochemistry": ["Lippincott Biochemistry 8th Edition", "Biochemistry 8th Edition", "A Textbook of Biochemistry 7th Edition", "Textbook of Biochemistry with Clinical Corelation  4th Edition"],
-    "medical_physiology": ["Pocket Companion to Guyton and Hall Textbook of Medical Physiology-12E", "Jaypee Essentials of medical physiology-6Ed", "Ganongs Review of Medical Physiology", "text book of practical  physiology"],
-    "organic_chemistry": ["Caravan Test Your Chemistry", "Morrison Boyd Organic Chemistry", "Organic Chemistry The Fundamental Principles (4th Edition, Vol-1)", "Advanced Organic chemistry 3rd Edition"],
-}
-
-@app.exception_handler(Exception)
-async def global_exception_handler(request, exc):
-    import traceback
-    traceback.print_exc()
-    return JSONResponse(
-        status_code=500,
-        content={"detail": str(exc)},
-        headers={"Access-Control-Allow-Origin": "*"}
-    )
-
 
 @app.get("/tables/{filename}")
 def get_table_image(filename: str):
@@ -175,7 +180,7 @@ def root():
 def get_books(subject: str):
     if subject not in SUBJECTS:
         raise HTTPException(status_code=400, detail="Invalid subject.")
-    books = STATIC_BOOKS.get(subject, [])
+    books = sorted({c.get("book_name") for c in rag_pipeline.all_chunks[subject] if c.get("book_name")})
     return {"subject": subject, "books": books}
 
 
@@ -340,8 +345,6 @@ def dashboard_stats():
 def query(request: QueryRequest, authorization: str = Header(None)):
     if request.subject not in SUBJECTS:
         raise HTTPException(status_code=400, detail=f"Invalid subject. Choose from: {SUBJECTS}")
-
-    rag_pipeline.ensure_subject_loaded(request.subject, max_books=2)
 
     # Generate thread_id if new chat
     thread_id = request.thread_id or str(uuid.uuid4())
